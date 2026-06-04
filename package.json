@@ -1,0 +1,20 @@
+{
+  "name": "poc-prompt-caching",
+  "version": "1.0.0",
+  "description": "POC: OpenAI prompt caching — compare latency and cost with and without cache",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "cached": "tsx src/scenarios/cached-session.ts",
+    "uncached": "tsx src/scenarios/uncached-calls.ts",
+    "compare": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "openai": "^4.98.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}

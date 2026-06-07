@@ -1,58 +1,70 @@
 /**
  * Scenario A — CACHED SESSION
  *
- * Simulates a multi-turn conversation where the system prompt never changes.
- * The same static prefix is sent on every call, so OpenAI's server can cache it.
+ * Sends the same system prompt on every independent API call.
+ * After the first call warms the cache, all subsequent calls pay
+ * only for the user message tokens at full price — the ~2 000-token
+ * system prompt is served from OpenAI's cache at 50 % of the input rate.
  *
- * Expected result:
- *  - Turn 1: cachedTokens = 0  (cold miss — first time this prefix is seen)
- *  - Turn 2+: cachedTokens ≈ systemPromptLength  (cache hit)
- *  - Latency drops noticeably from turn 2 onward
+ * Expected behaviour:
+ *   Call 1 : cachedTokens = 0   (cold miss — cache is being written)
+ *   Call 2+: cachedTokens ≈ len(SYSTEM_PROMPT)  (cache hit)
+ *   TTFT drops from ~1 500 ms → ~150 ms from call 2 onward
  */
 
 import OpenAI from 'openai';
 import { SYSTEM_PROMPT } from '../utils/prompt.js';
 import { calcCost, printHeader, printRow, printSummary, type TurnResult } from '../utils/display.js';
 
-const USER_TURNS = [
-  'Hi, I need to book an appointment with a cardiologist.',
-  'My name is James Anderson. Date of birth: March 12th, 1975.',
-  'I would prefer something next Tuesday afternoon if possible.',
-  'The second option sounds good. Can I confirm with my insurance?',
-  'I have Blue Cross Blue Shield, member ID 784512.',
-  'Yes, two o clock on Tuesday the 10th works perfectly.',
-  'Can you send a confirmation to my email?',
-  'Thank you. That\'s all I needed.',
-];
+const CALLS = 8;
+const USER_MESSAGE = 'Hi, I need to schedule an appointment with a cardiologist for next week. What are my options?';
 
-export async function runCachedSession(client: OpenAI): Promise<TurnResult[]> {
-  printHeader('Scenario A — Cached session (same system prompt every turn)');
-
-  const messages: OpenAI.ChatCompletionMessageParam[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-  ];
+export async function runCachedSession(
+  client: OpenAI,
+  onResult?: (r: TurnResult) => void,
+): Promise<TurnResult[]> {
+  printHeader('Scenario A — Cached (identical system prompt on every call)');
 
   const results: TurnResult[] = [];
 
-  for (let i = 0; i < USER_TURNS.length; i++) {
-    messages.push({ role: 'user', content: USER_TURNS[i] });
+  for (let i = 0; i < CALLS; i++) {
+    const messages: OpenAI.ChatCompletionMessageParam[] = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user',   content: USER_MESSAGE },
+    ];
 
     const start = Date.now();
-    const response = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages,
-    });
-    const latencyMs = Date.now() - start;
+    let ttfTokenMs = 0;
+    let firstContent = true;
+    let usageData: { prompt_tokens: number; completion_tokens: number; prompt_tokens_details?: { cached_tokens?: number } } | null = null;
 
-    const usage = response.usage!;
-    const promptTokens = usage.prompt_tokens;
-    const cachedTokens = (usage.prompt_tokens_details as { cached_tokens?: number })?.cached_tokens ?? 0;
+    const stream = await client.chat.completions.create({
+      model: 'gpt-4o',
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content ?? '';
+      if (firstContent && delta) {
+        ttfTokenMs = Date.now() - start;
+        firstContent = false;
+      }
+      if (chunk.usage) usageData = chunk.usage as typeof usageData;
+    }
+
+    const latencyMs = Date.now() - start;
+    const usage = usageData!;
+    const promptTokens   = usage.prompt_tokens;
+    const cachedTokens   = usage.prompt_tokens_details?.cached_tokens ?? 0;
     const completionTokens = usage.completion_tokens;
-    const cacheHitRate = promptTokens > 0 ? (cachedTokens / promptTokens) * 100 : 0;
+    const cacheHitRate   = promptTokens > 0 ? (cachedTokens / promptTokens) * 100 : 0;
 
     const result: TurnResult = {
       turn: i + 1,
       latencyMs,
+      ttfTokenMs,
       promptTokens,
       cachedTokens,
       completionTokens,
@@ -61,12 +73,9 @@ export async function runCachedSession(client: OpenAI): Promise<TurnResult[]> {
     };
 
     printRow(result);
+    onResult?.(result);
     results.push(result);
 
-    // Add the assistant reply to conversation history so next turn has context
-    messages.push({ role: 'assistant', content: response.choices[0].message.content ?? '' });
-
-    // Small delay so we don't hit rate limits
     await new Promise(r => setTimeout(r, 300));
   }
 

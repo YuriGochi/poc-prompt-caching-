@@ -1,59 +1,70 @@
 /**
  * Scenario B — UNCACHED CALLS
  *
- * Simulates the same 8 turns, but each call starts a brand-new conversation
- * with a unique system prompt prefix. This guarantees a cache miss every time
- * because OpenAI's cache key includes the exact token sequence from position 0.
+ * Injects a unique timestamp prefix before the system prompt on every call.
+ * Because OpenAI's cache key is the exact token sequence from position 0,
+ * any change to the prefix guarantees a cache miss — the full prompt is
+ * recomputed from scratch on every single call.
  *
- * Expected result:
- *  - Every turn: cachedTokens = 0
- *  - Latency remains consistently high
- *  - Total cost is higher than Scenario A
+ * Expected behaviour:
+ *   Every call: cachedTokens = 0
+ *   TTFT stays consistently high (~1 000–2 000 ms)
+ *   Total cost is ~2× higher than Scenario A from call 2 onward
  */
 
 import OpenAI from 'openai';
 import { withUniquePrefix } from '../utils/prompt.js';
 import { calcCost, printHeader, printRow, printSummary, type TurnResult } from '../utils/display.js';
 
-const USER_TURNS = [
-  'Hi, I need to book an appointment with a cardiologist.',
-  'My name is James Anderson. Date of birth: March 12th, 1975.',
-  'I would prefer something next Tuesday afternoon if possible.',
-  'The second option sounds good. Can I confirm with my insurance?',
-  'I have Blue Cross Blue Shield, member ID 784512.',
-  'Yes, two o clock on Tuesday the 10th works perfectly.',
-  'Can you send a confirmation to my email?',
-  'Thank you. That\'s all I needed.',
-];
+const CALLS = 8;
+const USER_MESSAGE = 'Hi, I need to schedule an appointment with a cardiologist for next week. What are my options?';
 
-export async function runUncachedCalls(client: OpenAI): Promise<TurnResult[]> {
-  printHeader('Scenario B — Uncached calls (unique prefix per call, no cache reuse)');
+export async function runUncachedCalls(
+  client: OpenAI,
+  onResult?: (r: TurnResult) => void,
+): Promise<TurnResult[]> {
+  printHeader('Scenario B — Uncached (unique prefix per call, cache miss guaranteed)');
 
   const results: TurnResult[] = [];
 
-  for (let i = 0; i < USER_TURNS.length; i++) {
-    // Each call gets a different system prompt prefix → cache miss guaranteed
+  for (let i = 0; i < CALLS; i++) {
     const messages: OpenAI.ChatCompletionMessageParam[] = [
       { role: 'system', content: withUniquePrefix(i) },
-      { role: 'user', content: USER_TURNS[i] },
+      { role: 'user',   content: USER_MESSAGE },
     ];
 
     const start = Date.now();
-    const response = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages,
-    });
-    const latencyMs = Date.now() - start;
+    let ttfTokenMs = 0;
+    let firstContent = true;
+    let usageData: { prompt_tokens: number; completion_tokens: number; prompt_tokens_details?: { cached_tokens?: number } } | null = null;
 
-    const usage = response.usage!;
-    const promptTokens = usage.prompt_tokens;
-    const cachedTokens = (usage.prompt_tokens_details as { cached_tokens?: number })?.cached_tokens ?? 0;
+    const stream = await client.chat.completions.create({
+      model: 'gpt-4o',
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content ?? '';
+      if (firstContent && delta) {
+        ttfTokenMs = Date.now() - start;
+        firstContent = false;
+      }
+      if (chunk.usage) usageData = chunk.usage as typeof usageData;
+    }
+
+    const latencyMs = Date.now() - start;
+    const usage = usageData!;
+    const promptTokens     = usage.prompt_tokens;
+    const cachedTokens     = usage.prompt_tokens_details?.cached_tokens ?? 0;
     const completionTokens = usage.completion_tokens;
-    const cacheHitRate = promptTokens > 0 ? (cachedTokens / promptTokens) * 100 : 0;
+    const cacheHitRate     = promptTokens > 0 ? (cachedTokens / promptTokens) * 100 : 0;
 
     const result: TurnResult = {
       turn: i + 1,
       latencyMs,
+      ttfTokenMs,
       promptTokens,
       cachedTokens,
       completionTokens,
@@ -62,6 +73,7 @@ export async function runUncachedCalls(client: OpenAI): Promise<TurnResult[]> {
     };
 
     printRow(result);
+    onResult?.(result);
     results.push(result);
 
     await new Promise(r => setTimeout(r, 300));

@@ -7,7 +7,8 @@
     "start": "tsx src/index.ts",
     "cached": "tsx src/scenarios/cached-session.ts",
     "uncached": "tsx src/scenarios/uncached-calls.ts",
-    "compare": "tsx src/index.ts"
+    "compare": "tsx src/index.ts",
+    "server": "tsx src/20260604-server.ts"
   },
   "dependencies": {
     "openai": "^4.98.0"

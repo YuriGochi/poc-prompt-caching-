@@ -1,125 +1,172 @@
-# POC — OpenAI Prompt Caching
+# OpenAI Prompt Caching — POC
 
-Demonstrates the latency and cost difference between LLM calls that hit the
-prompt cache versus calls that always miss it.
+A proof of concept that measures the real impact of OpenAI's prompt caching on **latency (TTFT)** and **cost** using a large, realistic system prompt (~4 500 tokens).
 
-## What this proves
+Includes a real-time web dashboard that visualizes cache hit rate, Time to First Token, and cost per call as they happen.
 
-OpenAI automatically caches the token prefix of any prompt that is 1024+ tokens
-and repeated across requests. When a cache hit occurs:
+---
 
-- Input latency drops up to **80%**
-- Cached token cost is **50% lower** than uncached input tokens
-- No code change required — the model returns `cached_tokens` in `usage`
+## Results
 
-## How it works
+Tests run with `gpt-4o`, an interleaved call structure (A1, B1, A2, B2...) to control for API ordering bias, and `max_tokens: 80` to isolate prompt processing time from response generation time.
 
-Two scenarios run back-to-back with the same 8 user messages:
+| Pair | Cached TTFT | Uncached TTFT | Improvement |
+|---|---|---|---|
+| 1 | 1 131ms | 506ms | B faster (A is cold miss) |
+| 2 | 447ms | 2 103ms | **A 79% faster** |
+| 3 | 618ms | 1 236ms | **A 50% faster** |
+| 4 | 510ms | 4 964ms | **A 90% faster** |
 
-| Scenario | System prompt | Cache behaviour |
+| Metric | Cached | Uncached | Difference |
+|---|---|---|---|
+| TTFT avg (warm cache, pairs 2–4) | ~525ms | ~2 768ms | **−79%** |
+| Total cost (5 call pairs) | ~$0.037 | ~$0.060 | **−38%** |
+| Cache hit rate | ~90% | 0% | — |
+
+> **Turn 1 is always a cache miss** — it warms the cache. The latency benefit starts from Turn 2 onward. This is why per-pair comparison matters more than the overall average.
+
+---
+
+## How Prompt Caching Works
+
+Every API call sends the full prompt to the model. Without caching, the model processes the entire prompt from scratch on every single call — including the system prompt that never changes.
+
+**Prompt caching stores the computation of repeated prefixes.** After the first call, subsequent calls that share the same exact token sequence from position 0 skip prompt processing entirely. Only the new user message is computed.
+
+```
+Scenario A — Cached                Scenario B — Uncached
+──────────────────────────────     ──────────────────────────────
+Call 1: [SYSTEM PROMPT]+[msg]      Call 1: [ts:111+SYSTEM]+[msg]
+         cache MISS (written)               cache MISS
+
+Call 2: [SYSTEM PROMPT]+[msg]      Call 2: [ts:222+SYSTEM]+[msg]
+         cache HIT  ✓                       cache MISS
+
+Call 3: [SYSTEM PROMPT]+[msg]      Call 3: [ts:333+SYSTEM]+[msg]
+         cache HIT  ✓                       cache MISS
+```
+
+**Why Scenario B always misses:** a unique timestamp is injected before the system prompt on every call. Because the cache key is the exact token sequence from position 0, changing even one token busts the cache entirely.
+
+### Key rules
+
+- Minimum **1 024 tokens** to be eligible for caching.
+- The prefix must be **byte-for-byte identical** across calls. Dynamic values (timestamps, session IDs, user names) injected into the system prompt break the cache.
+- Cache TTL is approximately **5–10 minutes** of inactivity.
+- Cached tokens are billed at **50% of the standard input price** — no configuration required.
+
+---
+
+## Why Model Size Matters for TTFT
+
+| Model | Uncached prompt processing | Cache benefit visible in TTFT? |
 |---|---|---|
-| **A — Cached session** | Identical every turn | Miss on turn 1, hits on turns 2-8 |
-| **B — Uncached calls** | Unique prefix per call | Miss every turn |
+| `gpt-4o-mini` | ~30–80ms | No — network latency (~150ms) exceeds the saving |
+| `gpt-4o` | ~400–800ms | Yes — clearly measurable per call |
 
-The only difference is whether the system prompt prefix is identical across
-calls or not. Everything else (model, user messages, temperature) is the same.
+This POC uses `gpt-4o` intentionally. On faster/smaller models the **cost benefit is identical**, but the latency improvement is too small to observe above natural API variability in a short test.
 
-## Prerequisites
+---
 
-1. **OpenAI account** — create one at https://platform.openai.com
-2. **API key** — go to *Settings → API keys → Create new secret key*
-3. **Credits** — add $5 in *Settings → Billing*. This POC costs less than $0.20 total.
+## Why Average TTFT Can Be Misleading
 
-You can set a monthly spending limit in *Settings → Limits* to avoid surprises.
+A naive average includes Turn 1 (always a cold miss) and any rate-limited turns (gpt-4o has strict TPM limits). The correct comparison is **per-pair**: each cached call (Ai) vs the uncached call (Bi) made seconds later under the same API conditions.
 
-## Setup
+This is why the runner interleaves calls (A1, B1, A2, B2...) instead of running all of A then all of B. Running sequentially introduces ordering bias — the API often warms up over the first few requests, making whichever scenario runs second look artificially faster.
 
-```bash
-git clone https://github.com/YOUR_USERNAME/poc-prompt-caching
-cd poc-prompt-caching
-npm install
-cp .env.example .env
-# edit .env and paste your API key
-```
+---
 
-## Run
-
-```bash
-# Run both scenarios and print side-by-side comparison
-OPENAI_API_KEY=sk-... npm start
-
-# Or if you have a .env file and dotenv installed:
-npm start
-```
-
-## Expected output
-
-```
-=== OpenAI Prompt Caching — POC ===
-
-Model   : gpt-4o-mini
-Turns   : 8 per scenario
-
-────────────────────────────────────────────────────────────────────────────────
-  Scenario A — Cached session (same system prompt every turn)
-────────────────────────────────────────────────────────────────────────────────
-Turn   Latency      Prompt tkns   Cached tkns   Hit rate              Cost (USD)
-────────────────────────────────────────────────────────────────────────────────
-1      1423ms       1521          0             ░░░░░░░░░░ 0%         $0.000228
-2      612ms        1628          1408          ████████░░ 86%        $0.000048
-3      589ms        1789          1408          ███████░░░ 78%        $0.000065
-...
-
-────────────────────────────────────────────────────────────────────────────────
-  Scenario B — Uncached calls (unique prefix per call, no cache reuse)
-────────────────────────────────────────────────────────────────────────────────
-Turn   Latency      Prompt tkns   Cached tkns   Hit rate              Cost (USD)
-────────────────────────────────────────────────────────────────────────────────
-1      1398ms       1535          0             ░░░░░░░░░░ 0%         $0.000230
-2      1341ms       1549          0             ░░░░░░░░░░ 0%         $0.000232
-...
-
-════════════════════════════════════════════════════════════════════════════════
-  FINAL COMPARISON
-════════════════════════════════════════════════════════════════════════════════
-
-                        Cached session   Uncached calls   Saving
-─────────────────────────────────────────────────────────────────
-Avg latency (ms)        621              1370             -55%
-Total cost (USD)        $0.000412        $0.001841        -78%
-Avg cache hit rate      79%              0%
-```
-
-## Key concepts
-
-### Why does Turn 1 always miss?
-The cache is populated on first use. OpenAI's servers need to see the exact
-token sequence at least once before they can serve it from cache.
-
-### What breaks the cache?
-Any change to the token sequence **before** the variable content (user message).
-That's why Scenario B injects a unique timestamp at the very start of each
-system prompt — it shifts all subsequent tokens and invalidates the prefix.
-
-### Cache TTL
-OpenAI keeps cached prefixes for **5–10 minutes** by default (up to 1 hour on
-some models). For longer-running workflows, sending requests at least every few
-minutes maintains the cache warm.
-
-### Real-world implication
-In a production voice AI with a ~22,000-token system prompt (typical for a
-complex scheduling assistant), prompt caching reduces per-turn LLM cost by
-roughly 60–80% and trims 300–800ms from response time after the first turn.
-
-## Project structure
+## Project Structure
 
 ```
 src/
-  index.ts                 — runs both scenarios and prints comparison
-  scenarios/
-    cached-session.ts      — Scenario A: same prefix, cache hits
-    uncached-calls.ts      — Scenario B: unique prefix, always misses
-  utils/
-    prompt.ts              — system prompt (~1400 tokens) + unique-prefix helper
-    display.ts             — table formatting and cost calculation
+├── utils/
+│   ├── prompt.ts              # ~4 500-token hospital scheduling system prompt
+│   └── display.ts             # Terminal table renderer + TurnResult type
+├── scenarios/
+│   ├── cached-session.ts      # Scenario A: same prompt every call
+│   ├── uncached-calls.ts      # Scenario B: unique prefix every call
+│   └── 20260607-comparison.ts # Interleaved runner: A1, B1, A2, B2...
+├── 20260604-server.ts         # HTTP server + SSE + real-time web dashboard
+└── index.ts                   # CLI entry point (terminal output only)
 ```
+
+---
+
+## Setup
+
+**1. Clone and install**
+
+```bash
+git clone https://github.com/YuriGochi/poc-prompt-caching-.git
+cd poc-prompt-caching-
+npm install
+```
+
+**2. Configure your API key**
+
+```bash
+cp .env.example .env
+# Edit .env and add your OpenAI API key
+```
+
+**3. Run**
+
+```bash
+# Web dashboard (recommended)
+npm run server
+# Open http://localhost:3000 and click Run POC
+
+# Terminal only
+npm start
+```
+
+> **Cost warning:** each full run with `gpt-4o` costs approximately $0.10–0.15. Set a spending limit in your OpenAI dashboard before running.
+
+---
+
+## How TTFT Is Measured
+
+The scenarios use the OpenAI streaming API to capture Time to First Token precisely:
+
+```typescript
+const start = Date.now();
+const stream = await client.chat.completions.create({
+  model: 'gpt-4o',
+  messages,
+  stream: true,
+  stream_options: { include_usage: true }, // returns cached_tokens in usage
+  max_tokens: 80,                          // short response keeps TTFT = prompt processing time
+});
+
+for await (const chunk of stream) {
+  if (firstToken && chunk.choices[0]?.delta?.content) {
+    ttfTokenMs = Date.now() - start;
+    firstToken = false;
+  }
+  if (chunk.usage) {
+    cachedTokens = chunk.usage.prompt_tokens_details.cached_tokens;
+  }
+}
+```
+
+`max_tokens: 80` limits response generation so that TTFT reflects prompt processing time — exactly what caching eliminates.
+
+---
+
+## Interpreting the Web Dashboard
+
+- **Green bar** — cache hit. Width represents the hit rate percentage.
+- **TTFT** — time until the model started responding. This is what end users perceive as speed.
+- **Total** — full round-trip including response generation.
+- **Cost** — estimated using official OpenAI pricing (input, cached input, and output tokens).
+
+---
+
+## The Bottom Line
+
+Prompt caching is primarily a **cost optimization**. At 50% off on cached input tokens, the savings scale directly with call volume — a system making 100k calls/day with a 4 500-token system prompt saves roughly half its input token spend with zero logic changes and zero configuration.
+
+The **latency benefit** is real but requires a model large enough (or a prompt long enough) for the saving to exceed API noise. With `gpt-4o` and a 4 500-token system prompt, the TTFT improvement is 50–90% on warm-cache calls.
+
+The only requirement to benefit: keep the system prompt prefix identical across calls.
